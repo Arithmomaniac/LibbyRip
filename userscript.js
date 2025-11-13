@@ -12,7 +12,7 @@
 // @match         *://*.read.overdrive.com/?*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
-// @require       https://cdn.jsdelivr.net/npm/client-zip/index.js
+// @require       https://unpkg.com/client-zip@2.5.0/worker.js
 // @grant         none
 // ==/UserScript==
 
