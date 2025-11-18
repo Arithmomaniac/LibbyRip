@@ -431,22 +431,17 @@
             };
         });
         
-        // Add metadata creation to run in parallel with file downloads
-        if (addMeta) {
-            fetchPromises.push(createMetadata());
-        }
+        // Start metadata creation in parallel with file downloads
+        const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
         
-        // Wait for all downloads to complete
-        const allFiles = await Promise.all(fetchPromises);
+        // Wait for both file downloads and metadata creation to complete
+        const [downloadedFiles, metadataFiles] = await Promise.all([
+            Promise.all(fetchPromises),
+            metadataPromise
+        ]);
         
-        // Flatten and add all files (metadata returns array, so we need to flatten)
-        allFiles.forEach(item => {
-            if (Array.isArray(item)) {
-                files.push(...item);
-            } else {
-                files.push(item);
-            }
-        });
+        files.push(...downloadedFiles);
+        files.push(...metadataFiles);
 
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
         downloadElem.innerHTML += "Generating zip file...";
