@@ -431,12 +431,16 @@
             };
         });
         
+        // Start metadata creation in parallel with file downloads
+        const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
+
         // Wait for all files to be fetched
         const downloadedFiles = await Promise.all(fetchPromises);
         files.push(...downloadedFiles);
 
-        if (addMeta) {
-            const metadataFiles = await createMetadata();
+        // Wait for metadata creation to complete
+        const metadataFiles = await metadataPromise;
+        if (metadataFiles.length > 0) {
             files.push(...metadataFiles);
         }
 
