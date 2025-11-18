@@ -431,14 +431,17 @@
             };
         });
         
-        // Wait for all files to be fetched
-        const downloadedFiles = await Promise.all(fetchPromises);
+        // Start metadata creation in parallel with file downloads
+        const metadataPromise = addMeta ? createMetadata() : Promise.resolve([]);
+        
+        // Wait for both file downloads and metadata creation to complete
+        const [downloadedFiles, metadataFiles] = await Promise.all([
+            Promise.all(fetchPromises),
+            metadataPromise
+        ]);
+        
         files.push(...downloadedFiles);
-
-        if (addMeta) {
-            const metadataFiles = await createMetadata();
-            files.push(...metadataFiles);
-        }
+        files.push(...metadataFiles);
 
         downloadElem.innerHTML += "<br><b>Downloads complete!</b> Now waiting for them to be assembled! (This might take a <b><i>minute</i></b>) <br>";
         downloadElem.innerHTML += "Generating zip file...";
