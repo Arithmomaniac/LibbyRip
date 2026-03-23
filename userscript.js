@@ -13,27 +13,145 @@
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @require       https://unpkg.com/client-zip@2.5.0/worker.js
-// @grant         none
+// @require       https://cdn.jsdelivr.net/npm/idb-keyval@6/dist/umd.js
+// @grant         GM_xmlhttpRequest
+// @grant         unsafeWindow
 // ==/UserScript==
 
 (()=>{
 
-    // Since the ffmpeg.js file is 50mb, it slows the page down too much
-    // to be in a "require" attribute, so we load it in async
-    function addFFmpegJs(){
-        let scriptTag = document.createElement("script");
-        scriptTag.setAttribute("type", "text/javascript");
-        scriptTag.setAttribute("src", "https://github.com/PsychedelicPalimpsest/FFmpeg-js/releases/download/14/0.12.5.bundle.js");
-        document.body.appendChild(scriptTag);
+    const FFMPEG_CORE_VERSION = "0.12.10";
+    const FFMPEG_CORE_BASE = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
+    const ffmpegCacheStore = idbKeyval.createStore('libregrip-ffmpeg-cache', 'bundles');
 
-        return new Promise(accept =>{
-            let i = setInterval(()=>{
-                if (window.createFFmpeg){
-                    clearInterval(i);
-                    accept(window.createFFmpeg);
-                }
-            }, 50)
+    // Fetch via GM_xmlhttpRequest (bypasses CORS/CSP)
+    function gmFetch(url, responseType = 'text') {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                responseType,
+                onload: (resp) => resolve(responseType === 'arraybuffer' ? resp.response : resp.responseText),
+                onerror: (err) => reject(new Error(`GM_xmlhttpRequest failed: ${err.statusText || 'unknown'}`)),
             });
+        });
+    }
+
+    // Fetch as blob URL, with IDB caching
+    async function cachedFetchBlobURL(url, cacheKey, mimeType, versionMatch) {
+        if (versionMatch) {
+            try {
+                const t0 = performance.now();
+                const cached = await idbKeyval.get(cacheKey, ffmpegCacheStore);
+                if (cached) {
+                    const blobUrl = URL.createObjectURL(new Blob([cached], { type: mimeType }));
+                    console.log(`LibreGRAB: ${cacheKey} from IDB (${((performance.now() - t0) / 1000).toFixed(1)}s)`);
+                    return blobUrl;
+                }
+            } catch (e) {
+                console.warn(`LibreGRAB: IDB read failed for ${cacheKey}`, e);
+            }
+        }
+
+        console.log(`LibreGRAB: Downloading ${cacheKey}...`);
+        const isWasm = mimeType === 'application/wasm';
+        const data = await gmFetch(url, isWasm ? 'arraybuffer' : 'text');
+
+        try {
+            await idbKeyval.set(cacheKey, data, ffmpegCacheStore);
+            await idbKeyval.set('ffmpeg-core-version', FFMPEG_CORE_VERSION, ffmpegCacheStore);
+        } catch (e) {
+            console.warn(`LibreGRAB: IDB write failed for ${cacheKey}`, e);
+        }
+
+        return URL.createObjectURL(new Blob([data], { type: mimeType }));
+    }
+
+    // Inlined worker — self-contained, no external imports
+    const WORKER_CODE = `
+const FFMessageType = {LOAD:"LOAD",EXEC:"EXEC",FFPROBE:"FFPROBE",WRITE_FILE:"WRITE_FILE",READ_FILE:"READ_FILE",DELETE_FILE:"DELETE_FILE",RENAME:"RENAME",CREATE_DIR:"CREATE_DIR",LIST_DIR:"LIST_DIR",DELETE_DIR:"DELETE_DIR",ERROR:"ERROR",DOWNLOAD:"DOWNLOAD",PROGRESS:"PROGRESS",LOG:"LOG",MOUNT:"MOUNT",UNMOUNT:"UNMOUNT"};
+let ffmpeg;
+const load = async ({ coreURL: _coreURL, wasmURL: _wasmURL, workerURL: _workerURL }) => {
+    const first = !ffmpeg;
+    try { importScripts(_coreURL); }
+    catch (e) { throw new Error("failed to import ffmpeg-core.js: " + e.message); }
+    const coreURL = _coreURL;
+    const wasmURL = _wasmURL ? _wasmURL : _coreURL.replace(/.js$/g,".wasm");
+    const workerURL = _workerURL ? _workerURL : _coreURL.replace(/.js$/g,".worker.js");
+    ffmpeg = await self.createFFmpegCore({ mainScriptUrlOrBlob: coreURL+"#"+btoa(JSON.stringify({wasmURL,workerURL})) });
+    ffmpeg.setLogger((data)=>self.postMessage({type:FFMessageType.LOG,data}));
+    ffmpeg.setProgress((data)=>self.postMessage({type:FFMessageType.PROGRESS,data}));
+    return first;
+};
+const exec = ({args,timeout=-1})=>{ffmpeg.setTimeout(timeout);ffmpeg.exec(...args);const ret=ffmpeg.ret;ffmpeg.reset();return ret;};
+const ffprobe = ({args,timeout=-1})=>{ffmpeg.setTimeout(timeout);ffmpeg.ffprobe(...args);const ret=ffmpeg.ret;ffmpeg.reset();return ret;};
+const writeFile = ({path,data})=>{ffmpeg.FS.writeFile(path,data);return true;};
+const readFile = ({path,encoding})=>ffmpeg.FS.readFile(path,{encoding});
+const deleteFile = ({path})=>{ffmpeg.FS.unlink(path);return true;};
+const rename = ({oldPath,newPath})=>{ffmpeg.FS.rename(oldPath,newPath);return true;};
+const createDir = ({path})=>{ffmpeg.FS.mkdir(path);return true;};
+const listDir = ({path})=>{const names=ffmpeg.FS.readdir(path);const nodes=[];for(const name of names){const stat=ffmpeg.FS.stat(path+"/"+name);nodes.push({name,isDir:ffmpeg.FS.isDir(stat.mode)});}return nodes;};
+const deleteDir = ({path})=>{ffmpeg.FS.rmdir(path);return true;};
+const mount = ({fsType,options,mountPoint})=>{const fs=ffmpeg.FS.filesystems[fsType];if(!fs)return false;ffmpeg.FS.mount(fs,options,mountPoint);return true;};
+const unmount = ({mountPoint})=>{ffmpeg.FS.unmount(mountPoint);return true;};
+self.onmessage = async ({data:{id,type,data:_data}})=>{
+    const trans=[];let data;
+    try{
+        if(type!=="LOAD"&&!ffmpeg)throw new Error("ffmpeg is not loaded");
+        switch(type){
+            case "LOAD":data=await load(_data);break;
+            case "EXEC":data=exec(_data);break;
+            case "FFPROBE":data=ffprobe(_data);break;
+            case "WRITE_FILE":data=writeFile(_data);break;
+            case "READ_FILE":data=readFile(_data);break;
+            case "DELETE_FILE":data=deleteFile(_data);break;
+            case "RENAME":data=rename(_data);break;
+            case "CREATE_DIR":data=createDir(_data);break;
+            case "LIST_DIR":data=listDir(_data);break;
+            case "DELETE_DIR":data=deleteDir(_data);break;
+            case "MOUNT":data=mount(_data);break;
+            case "UNMOUNT":data=unmount(_data);break;
+            default:throw new Error("unknown message type");
+        }
+    }catch(e){self.postMessage({id,type:"ERROR",data:e.toString()});return;}
+    if(data instanceof Uint8Array)trans.push(data.buffer);
+    self.postMessage({id,type,data},trans);
+};
+`;
+
+    // Load and initialize official @ffmpeg/ffmpeg
+    async function loadFFmpeg() {
+        const t0 = performance.now();
+
+        let versionMatch = false;
+        try {
+            const v = await idbKeyval.get('ffmpeg-core-version', ffmpegCacheStore);
+            versionMatch = v === FFMPEG_CORE_VERSION;
+        } catch (e) {}
+
+        // Fetch core JS via GM_xmlhttpRequest (bypasses CSP), create blob URL
+        // Worker will importScripts(blobURL) — works because blob is same-origin
+        const coreBlobURL = await cachedFetchBlobURL(
+            `${FFMPEG_CORE_BASE}/ffmpeg-core.js`, 'ffmpeg-core-js', 'text/javascript', versionMatch
+        );
+
+        // WASM uses direct CDN URL so browser can cache compiled module
+        const wasmURL = `${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`;
+
+        const workerBlob = URL.createObjectURL(new Blob([WORKER_CODE], { type: 'text/javascript' }));
+
+        // Import the ESM FFmpeg class
+        const { FFmpeg } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm');
+
+        console.log(`LibreGRAB: Assets ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+
+        const ffmpegInstance = new FFmpeg();
+        console.log(`LibreGRAB: Calling ffmpeg.load()...`);
+        const loadT0 = performance.now();
+        await ffmpegInstance.load({ coreURL: coreBlobURL, wasmURL, classWorkerURL: workerBlob });
+        console.log(`LibreGRAB: ffmpeg.load() took ${((performance.now() - loadT0) / 1000).toFixed(1)}s`);
+
+        return ffmpegInstance;
     }
 
     let downloadElem;
@@ -301,10 +419,8 @@
             const response = await fetch(url.url);
             const blob = await response.blob();
 
-            // Dump it into ffmpeg (We do the request here as not to bog down the worker thread)
-            const blob_url = URL.createObjectURL(blob);
-            await ffmpeg.writeFileFromUrl((url.index + 1) + ".mp3", blob_url);
-            URL.revokeObjectURL(blob_url);
+            // Dump it into ffmpeg
+            await ffmpeg.writeFile((url.index + 1) + ".mp3", new Uint8Array(await blob.arrayBuffer()));
 
 
             downloadElem.innerHTML += `Download of disk ${url.index + 1} complete! <br>`
@@ -321,9 +437,7 @@
 
             coverName = "cover." + csplit[csplit.length-1];
 
-            const blob_url = URL.createObjectURL(blob);
-            await ffmpeg.writeFileFromUrl(coverName, blob_url);
-            URL.revokeObjectURL(blob_url);
+            await ffmpeg.writeFile(coverName, new Uint8Array(await blob.arrayBuffer()));
         }
 
 
@@ -339,11 +453,11 @@
         }
         await ffmpeg.writeFile("files.txt", files);
 
-        ffmpeg.setProgress((progress)=>{
+        ffmpeg.on('progress', (progress)=>{
             // The progress.time feature seems to be in micro secounds
             downloadElem.querySelector("#mp3Progress").textContent = (progress.time / 1000000 / 3600).toFixed(2);
         });
-        ffmpeg.setLogger(console.log);
+        ffmpeg.on('log', ({ message }) => console.log(message));
 
         await ffmpeg.exec([
                            "-y", "-f", "concat",
@@ -368,7 +482,8 @@
 
 
 
-        let blob_url = await ffmpeg.readFileToUrl("out.mp3");
+        const outData = await ffmpeg.readFile("out.mp3");
+        let blob_url = URL.createObjectURL(new Blob([outData.buffer || outData]));
 
         const link = document.createElement('a');
         link.href = blob_url;
@@ -393,19 +508,10 @@
 		console.log("initFFmpeg");
 		if (ffmpegInitPromise) return ffmpegInitPromise;
 		ffmpegInitPromise = (async () => {
-			if (!window.createFFmpeg) {
-				downloadElem.innerHTML += "Downloading FFmpeg.wasm (~50MB)<br>";
-				console.log("Downloading FFmpeg.wasm (~50MB)");
-				await addFFmpegJs();
-				downloadElem.innerHTML += "Completed FFmpeg.wasm download<br>";
-				console.log("Completed FFmpeg.wasm download");
-			}
-
-			// Initialize FFmpeg if not already done
 			if (!ffmpeg) {
 				downloadElem.innerHTML += "Initializing FFmpeg.wasm<br>";
 				console.log("Initializing FFmpeg.wasm");
-				ffmpeg = await window.createFFmpeg({ log: true });
+				ffmpeg = await loadFFmpeg();
 				downloadElem.innerHTML += "FFmpeg.wasm initialized<br>";
 				console.log("FFmpeg.wasm initialized");
 			}
@@ -489,7 +595,7 @@
         // Try using File System Access API for streaming (much faster)
         if ('showSaveFilePicker' in window) {
             try {
-                const handle = await window.showSaveFilePicker({
+                const handle = await unsafeWindow.showSaveFilePicker({
                     suggestedName: filename,
                     types: [{
                         description: 'ZIP Archive',
@@ -569,7 +675,7 @@
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    window.pages = {};
+    unsafeWindow.pages = {};
 
     // Libby used the bind method as a way to "safely" expose
     // the decryption module. THIS IS THEIR DOWNFALL.
@@ -589,7 +695,7 @@
         if (this.toString().includes('decryption') || 
             args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
             console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+            unsafeWindow.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
         }
         
         return boundFn;
@@ -600,14 +706,14 @@
         let components = getBookComponents();
         // Force all the chapters to load in.
         components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
+            if (undefined != unsafeWindow.pages[page.id]) return;
             page._loadContent({callback: ()=>{}})
         });
         // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
+        while (components.filter((page)=>undefined==unsafeWindow.pages[page.id]).length){
             await new Promise(r => setTimeout(r, 100));
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
+            console.log(components.filter((page)=>undefined==unsafeWindow.pages[page.id]).length);
         }
     }
     function getBookComponents(){
@@ -640,7 +746,7 @@
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=unsafeWindow.pages[page.id]).length}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -651,7 +757,7 @@
         components.forEach(c=>{
             // Nothing that can be done here...
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
+                console.warn("!!!" + unsafeWindow.pages[c.id]);
                 return;
             }
             c.meta.id = c.meta.id || crypto.randomUUID()
@@ -669,12 +775,12 @@
             });
         });
         let url = location.origin;
-        for (let i of Object.keys(window.pages)){
+        for (let i of Object.keys(unsafeWindow.pages)){
             if (idToIfram[i])
                 url = idToIfram[i].src;
             files.push({
                 name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+                input: fixXhtml(idToMetaId[i], url, unsafeWindow.pages[i], imgAssests, cssRegistry[i] || [])
             });
         }
 
@@ -1053,7 +1159,7 @@
         // Try using File System Access API for streaming (much faster)
         if ('showSaveFilePicker' in window) {
             try {
-                const handle = await window.showSaveFilePicker({
+                const handle = await unsafeWindow.showSaveFilePicker({
                     suggestedName: filename,
                     types: [{
                         description: 'EPUB eBook',
@@ -1097,16 +1203,16 @@ function bifFoundBook(){
     s.innerHTML = CSS;
     document.head.appendChild(s)
 
-    if (!window.__bif_cfc1){
+    if (!unsafeWindow.__bif_cfc1){
         alert("Injection failed! __bif_cfc1 not found");
         return;
     }
     
     // Debug: Log the original function structure
-    console.log("Original __bif_cfc1:", window.__bif_cfc1);
-    console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-    const old_crf1 = window.__bif_cfc1;
-    window.__bif_cfc1 = (win, edata)=>{
+    console.log("Original __bif_cfc1:", unsafeWindow.__bif_cfc1);
+    console.log("__bif_cfc1.__boundArgs:", unsafeWindow.__bif_cfc1.__boundArgs);
+    const old_crf1 = unsafeWindow.__bif_cfc1;
+    unsafeWindow.__bif_cfc1 = (win, edata)=>{
         // If the bind hook succeeds, then the first element of bound args
         // will be the decryption function. So we just passivly build up an
         // index of the pages!
@@ -1115,9 +1221,9 @@ function bifFoundBook(){
         } else {
             console.warn("Bind args not found, trying alternative decryption method");
             // Try global decryption function if available
-            if (window.__libregrab_decryption_fn) {
+            if (unsafeWindow.__libregrab_decryption_fn) {
                 try {
-                    pages[win.name] = window.__libregrab_decryption_fn(edata);
+                    pages[win.name] = unsafeWindow.__libregrab_decryption_fn(edata);
                 } catch (error) {
                     console.error("Global decryption function failed:", error);
                 }
@@ -1179,7 +1285,7 @@ function buildBookPirateUi(){
 // stuff, so we wait until the page is loaded, and the
 // BIF is present, to inject the pirate menu.
 let intr = setInterval(()=>{
-    if (window.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined){
+    if (unsafeWindow.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined){
         clearInterval(intr);
         let mode = location.hostname.split(".")[1];
         if (mode == "listen"){
